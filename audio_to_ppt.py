@@ -1,9 +1,8 @@
 import os
 import re
 import time
-import uuid
 import json
-import glob
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
@@ -13,9 +12,9 @@ from mutagen.flac import FLAC
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 
-# --- 新增: OpenAI 库 ---
+# --- OpenAI 库 ---
 try:
     from openai import OpenAI
 except ImportError:
@@ -23,81 +22,42 @@ except ImportError:
     OpenAI = None
 
 # ==========================================
-# 配置初始化逻辑
+# 配置初始化
 # ==========================================
 CONFIG_FILE = "ai_config.json"
 DEFAULT_KEY_PLACEHOLDER = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 def init_ai_configuration():
-    """
-    初始化 AI 配置：
-    1. 尝试读取配置文件
-    2. 如果不存在或配置无效，则在命令行引导用户输入
-    3. 保存配置到文件
-    """
     default_config = {
         "enabled": True,
         "api_key": DEFAULT_KEY_PLACEHOLDER,
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-3.5-turbo",
-        "max_retries": 3
+        "max_retries": 3,
+        "max_workers": 4
     }
 
-    # 1. 尝试读取现有配置
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved_config = json.load(f)
+                updated = False
                 for k, v in default_config.items():
                     if k not in saved_config:
                         saved_config[k] = v
-                
-                if saved_config["enabled"] and (not saved_config["api_key"] or saved_config["api_key"] == DEFAULT_KEY_PLACEHOLDER):
-                    print("[提示] 配置文件存在，但 API Key 无效。")
-                else:
-                    return saved_config
-        except Exception as e:
-            print(f"[警告] 读取配置文件失败: {e}，将重新配置。")
+                        updated = True
+                if updated:
+                    with open(CONFIG_FILE, "w", encoding="utf-8") as fw:
+                        json.dump(saved_config, fw, indent=4, ensure_ascii=False)
+                return saved_config
+        except: pass
 
-    # 2. 进入交互式配置向导
-    print("\n" + "="*50)
-    print("       AI 歌词清洗功能配置向导")
-    print("="*50)
-    print("检测到这是你第一次运行，或者 AI 配置尚未完成。")
-    print("为了去除歌词中的废话（作词、作曲、推广等），我们需要配置 AI 接口。\n")
-
-    use_ai = input("是否开启 AI 歌词清洗功能? (y/n) [默认: y]: ").strip().lower()
-    if use_ai == 'n':
-        default_config["enabled"] = False
-        print("[设置] 已关闭 AI 功能。")
-    else:
-        default_config["enabled"] = True
-        while True:
-            user_key = input("\n请输入你的 API Key (必填): ").strip()
-            if user_key and user_key != DEFAULT_KEY_PLACEHOLDER:
-                default_config["api_key"] = user_key
-                break
-            print("[错误] API Key 不能为空，请重新输入。")
-
-        print(f"\n请输入接口地址 (Base URL)")
-        print(f"如果你使用 OpenAI 官方，直接回车即可。")
-        print(f"如果你使用 DeepSeek/Kimi/OneApi 等中转，请输入对应的 v1 地址。")
-        user_url = input(f"地址 [默认: {default_config['base_url']}]: ").strip()
-        if user_url:
-            default_config["base_url"] = user_url
-
-        user_model = input(f"\n请输入模型名称 [默认: {default_config['model']}]: ").strip()
-        if user_model:
-            default_config["model"] = user_model
-
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(default_config, f, indent=4, ensure_ascii=False)
-        print(f"\n[成功] 配置已保存至 {CONFIG_FILE}")
-        print("="*50 + "\n")
-    except Exception as e:
-        print(f"[错误] 无法写入配置文件: {e}")
-
+    if not os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(default_config, f, indent=4, ensure_ascii=False)
+        except: pass
+    
     return default_config
 
 AI_CONFIG = init_ai_configuration()
@@ -112,46 +72,39 @@ def safe_print(msg):
         print(msg)
 
 def call_ai_to_clean_lyrics(raw_text, log_tag):
-    if not AI_CONFIG["enabled"] or not OpenAI:
-        return raw_text
-    
-    if len(raw_text) < 10:
-        return raw_text
+    if not AI_CONFIG["enabled"] or not OpenAI: return raw_text
+    if len(raw_text) < 10: return raw_text
 
     client = OpenAI(api_key=AI_CONFIG["api_key"], base_url=AI_CONFIG["base_url"])
     
-    system_prompt = "你是一个歌词处理程序。"
+    system_prompt = "你是一个专业的歌词整理助手。"
     user_prompt = (
         "请严格执行以下操作：\n"
         "1. 如果歌词包含'纯音乐'、'Instrumental'或没有实际歌词内容，请仅回复: [PURE_MUSIC]\n"
         "2. 删除头部元数据（作词、作曲、编曲等）。\n"
         "3. 删除尾部宣传信息（统筹、出品、邮箱等）。\n"
-        "4. 必须保留原有的换行格式。\n"
-        "5. 不要输出任何解释，只输出结果。\n\n"
-        "待处理文本：\n"
-        f"{raw_text}"
+        "4. [重要] 如果是外语歌且包含翻译（如中文翻译），请删除所有翻译内容，只保留原文歌词。\n"
+        "5. 必须保留原有的换行格式，不要随意合并行。\n"
+        "6. [关键] 如果单行歌词过长（超过18个字符，包括标点符号在内），请根据语义停顿在中间插入符号 '^' 以便后续强制换行（例如：'长句的前半部分^长句的后半部分'）。注意仅插入符号，不要直接回车。\n"
+        "7. [关键] 如果单行歌词内出现点号（逗号、句号等）将该符号换为 '^' ，若为该*行*歌词最后一个标点则删去该标点符号，注意仅插入或删去符号，不要直接回车。\n"
+        "8. [关键] 如果单行歌词内出现括号、双引号等则在后面添加符号 '^' ，若为该*行*歌词最后一个标点则不做改动，注意仅插入符号，不要直接回车。（例如：'它匍匐（将人们恶言吐露）^痛哭（斥责神明的残酷）'）\n"
+        "9. 不要输出任何解释，只输出结果。\n\n"
+        "待处理文本：\n" + raw_text
     )
 
     for attempt in range(AI_CONFIG["max_retries"]):
         try:
             response = client.chat.completions.create(
                 model=AI_CONFIG["model"],
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.1,
-                timeout=20
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                temperature=0.1, timeout=20
             )
-            cleaned_content = response.choices[0].message.content.strip()
-            safe_print(f"[{log_tag}] [AI] 清洗成功 (尝试 {attempt+1}/{AI_CONFIG['max_retries']})")
-            return cleaned_content
-
+            content = response.choices[0].message.content.strip()
+            safe_print(f"[{log_tag}] [AI] 清洗成功 (已智能分行)")
+            return content
         except Exception as e:
-            safe_print(f"[{log_tag}] [警告] AI调用失败 (尝试 {attempt+1}/{AI_CONFIG['max_retries']}): {e}")
+            safe_print(f"[{log_tag}] [警告] AI调用失败 (尝试 {attempt+1}): {e}")
             time.sleep(1)
-
-    safe_print(f"[{log_tag}] [错误] AI多次重试失败，将使用原始歌词")
     return raw_text
 
 class AudioToPPT:
@@ -161,31 +114,47 @@ class AudioToPPT:
         self.file_name = os.path.basename(audio_path)
         self.is_pure_music = False
         
-        self.uid = uuid.uuid4().hex[:8] 
-        self.temp_bg = f"temp_bg_{self.uid}.jpg"
-        self.temp_cover = f"temp_cover_{self.uid}.jpg"
-        self.temp_mask_top = f"temp_mask_top_{self.uid}.jpg"
-        self.temp_mask_bottom = f"temp_mask_bottom_{self.uid}.jpg"
+        self.mem_bg = None
+        self.mem_cover = None
+        self.mem_mask_top = None
+        self.mem_mask_bottom = None
         
-        self.metadata = {
-            'title': '未知标题', 'artist': '未知歌手', 'lyrics': [], 'cover_data': None
-        }
+        self.metadata = {'title': '未知标题', 'artist': '未知歌手', 'lyrics': [], 'cover_data': None}
         
-        self.SLIDE_W = Inches(13.333) 
-        self.SLIDE_H = Inches(7.5)
+        # --- 📐 布局参数 ---
+        self.SLIDE_W_INCH = 13.333
+        self.SLIDE_H_INCH = 7.5
+        
+        self.SLIDE_W = Inches(self.SLIDE_W_INCH)
+        self.SLIDE_H = Inches(self.SLIDE_H_INCH)
         self.CENTER_Y = self.SLIDE_H / 2
-        self.SCROLL_UNIT_HEIGHT = Inches(0.9) 
-        self.TEXTBOX_W = Inches(8.0)
-        self.TEXTBOX_X = Inches(4.5) 
-        self.TEXTBOX_H = Inches(100)
         
-        self.STYLE_ACTIVE = {'size': 40, 'bold': True, 'color': (255, 255, 255)}
-        self.STYLE_NORMAL = {'size': 26, 'bold': False, 'color': (150, 150, 150)}
+        self.MASK_H_INCH = 2.2
+        self.LINE_SPACING = Inches(1.35)
+        
+        # --- [歌词页] 核心布局计算 ---
+        ratio_left = 0.4
+        zone_left_width = self.SLIDE_W_INCH * ratio_left
+        zone_right_width = self.SLIDE_W_INCH * (1 - ratio_left)
+        
+        # [歌词页] 左侧封面布局
+        self.LYRIC_COVER_SIZE_VAL = 3.5
+        self.LYRIC_COVER_SIZE = Inches(self.LYRIC_COVER_SIZE_VAL)
+        cover_margin = (zone_left_width - self.LYRIC_COVER_SIZE_VAL) / 2
+        self.LYRIC_COVER_LEFT = Inches(cover_margin)
+        
+        # [歌词页] 右侧歌词布局
+        self.TEXTBOX_W = Inches(7.8) 
+        text_margin_in_zone = (zone_right_width - 7.8) / 2
+        self.TEXTBOX_X = Inches(zone_left_width + text_margin_in_zone)
+        self.TEXTBOX_H = Inches(2.2) 
+        
+        # 字体样式
+        self.STYLE_ACTIVE = {'size': 40, 'bold': True, 'color': (255, 255, 255)} 
+        self.STYLE_NORMAL = {'size': 24, 'bold': False, 'color': (160, 160, 160)} 
 
     def _log(self, msg):
-        tag = self.metadata.get('title', '')
-        if not tag or tag == '未知标题':
-            tag = self.file_name
+        tag = self.metadata.get('title', self.file_name)
         safe_print(f"[{tag}] {msg}")
 
     def parse_lyrics_lines(self, text_content):
@@ -195,8 +164,7 @@ class AudioToPPT:
         pattern = re.compile(r'\[\d{1,3}:\d{2}(?:\.\d{1,3})?\]')
         for line in lines:
             line_content = re.sub(pattern, '', line).strip()
-            if line_content: 
-                cleaned_lines.append(line_content)
+            if line_content: cleaned_lines.append(line_content)
         return cleaned_lines
 
     def extract_metadata(self):
@@ -216,24 +184,18 @@ class AudioToPPT:
                      if uslt: raw_lyrics_text = uslt[0].text
 
                 if raw_lyrics_text:
-                    self._log(f"[处理] 正在分析歌词...")
-                    
                     if "纯音乐" in raw_lyrics_text or "Instrumental" in raw_lyrics_text:
                         self.is_pure_music = True
-                        self._log("[识别] 检测到纯音乐标记 (元数据)")
+                        self._log("检测到纯音乐标记")
                     else:
-                        display_name = self.metadata['title'] if self.metadata['title'] != '未知标题' else self.file_name
-                        ai_result = call_ai_to_clean_lyrics(raw_lyrics_text, display_name)
-                        
+                        ai_result = call_ai_to_clean_lyrics(raw_lyrics_text, self.metadata['title'])
                         if "[PURE_MUSIC]" in ai_result:
                             self.is_pure_music = True
-                            self._log("[识别] AI 判定为纯音乐")
+                            self._log("AI 判定为纯音乐")
                         else:
                             final_lines = self.parse_lyrics_lines(ai_result)
                             self.metadata['lyrics'] = final_lines
-                            if not final_lines:
-                                self.is_pure_music = True
-                                self._log("[识别] 清洗后无有效歌词，视为纯音乐")
+                            if not final_lines: self.is_pure_music = True
                 else:
                     self.is_pure_music = True
                 
@@ -245,208 +207,290 @@ class AudioToPPT:
                              self.metadata['cover_data'] = audio.tags[key].data
                              break
         except Exception as e:
-            self._log(f"[警告] 元数据读取可能有误: {e}")
+            self._log(f"[警告] 元数据错误: {e}")
+
+    def image_to_bytes(self, img_obj, format='JPEG', quality=95):
+        bio = BytesIO()
+        img_obj.save(bio, format=format, quality=quality)
+        bio.seek(0)
+        return bio
+
+    def add_gradient_transparency(self, img, direction='bottom'):
+        img = img.convert("RGBA")
+        width, height = img.size
+        gradient = Image.new('L', (1, height), color=255)
+        fade_len = 120 
+        for y in range(height):
+            if direction == 'bottom':
+                if y >= height - fade_len:
+                    alpha = int(255 * (height - y) / fade_len)
+                    gradient.putpixel((0, y), alpha)
+            elif direction == 'top':
+                if y < fade_len:
+                    alpha = int(255 * y / fade_len)
+                    gradient.putpixel((0, y), alpha)
+        alpha_mask = gradient.resize((width, height))
+        img.putalpha(alpha_mask)
+        return img
 
     def prepare_images(self):
         if not self.metadata['cover_data']: return None
         try:
             img = Image.open(BytesIO(self.metadata['cover_data'])).convert("RGB")
-            bg_img = img.filter(ImageFilter.GaussianBlur(radius=60))
-            bg_img = ImageEnhance.Brightness(bg_img).enhance(0.3) 
             target_w, target_h = 1280, 720
-            bg_img = bg_img.resize((target_w, target_h))
-            bg_img.save(self.temp_bg)
-            img.save(self.temp_cover)
-            mask_h = 200
-            mask_top = bg_img.crop((0, 0, target_w, mask_h))
-            mask_top.save(self.temp_mask_top)
-            mask_bottom = bg_img.crop((0, target_h - mask_h, target_w, target_h))
-            mask_bottom.save(self.temp_mask_bottom)
+            
+            # 高清背景
+            bg_final = img.resize((target_w, target_h), resample=Image.LANCZOS)
+            bg_final = bg_final.filter(ImageFilter.GaussianBlur(radius=60)) 
+            bg_final = ImageEnhance.Brightness(bg_final).enhance(0.3)
+            
+            self.mem_bg = self.image_to_bytes(bg_final, format='JPEG') 
+            self.mem_cover = self.image_to_bytes(img, format='JPEG')
+            
+            # 遮罩计算
+            mask_ratio = self.MASK_H_INCH / self.SLIDE_H_INCH
+            mask_pixel_h = int(target_h * mask_ratio)
+            
+            mask_top_img = bg_final.crop((0, 0, target_w, mask_pixel_h))
+            mask_top_img = self.add_gradient_transparency(mask_top_img, direction='bottom')
+            self.mem_mask_top = self.image_to_bytes(mask_top_img, format='PNG') 
+            
+            mask_bottom_img = bg_final.crop((0, target_h - mask_pixel_h, target_w, target_h))
+            mask_bottom_img = self.add_gradient_transparency(mask_bottom_img, direction='top')
+            self.mem_mask_bottom = self.image_to_bytes(mask_bottom_img, format='PNG')
+            
             return True
         except Exception as e:
             self._log(f"[跳过] 图片处理失败: {e}")
             return False
 
+    def create_cover_slide(self, prs):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        slide.shapes.add_picture(self.mem_bg, 0, 0, width=self.SLIDE_W, height=self.SLIDE_H)
+        
+        ALBUM_COVER_SIZE_VAL = 4.8
+        ALBUM_COVER_SIZE = Inches(ALBUM_COVER_SIZE_VAL)
+        
+        center_x = (self.SLIDE_W - ALBUM_COVER_SIZE) / 2
+        center_y = Inches(0.6) 
+        
+        slide.shapes.add_picture(self.mem_cover, center_x, center_y, width=ALBUM_COVER_SIZE, height=ALBUM_COVER_SIZE)
+        
+        text_top = center_y + ALBUM_COVER_SIZE + Inches(0.5)
+        tx_intro = slide.shapes.add_textbox(0, text_top, self.SLIDE_W, Inches(1.8))
+        tx_intro.text_frame.word_wrap = True
+        
+        p_title = tx_intro.text_frame.add_paragraph()
+        p_title.text = self.metadata['title'] 
+        p_title.font.size = Pt(36) 
+        p_title.font.bold = True
+        p_title.font.color.rgb = RGBColor(255, 255, 255)
+        p_title.alignment = PP_ALIGN.CENTER
+        
+        p_artist = tx_intro.text_frame.add_paragraph()
+        p_artist.text = self.metadata['artist']
+        p_artist.font.size = Pt(20)
+        p_artist.font.color.rgb = RGBColor(200, 200, 200)
+        p_artist.alignment = PP_ALIGN.CENTER
+        
+        return slide
+
     def generate_ppt(self):
         if os.path.exists(self.output_ppt_path):
-            try:
-                os.remove(self.output_ppt_path)
-                self._log(f"[清理] 已删除旧文件: {os.path.basename(self.output_ppt_path)}")
-            except PermissionError:
-                self._log(f"[错误] 无法删除旧文件，请先关闭PPT: {self.output_ppt_path}")
-                return False
+            try: os.remove(self.output_ppt_path)
+            except: pass
 
         prs = Presentation()
         prs.slide_width = self.SLIDE_W
         prs.slide_height = self.SLIDE_H
 
         if not self.prepare_images():
-            self._log("[跳过] 无法生成必要图片资源。")
+            self._log("无法生成图片资源，跳过")
             return False
 
-        # Slide 1: 封面
-        slide_intro = prs.slides.add_slide(prs.slide_layouts[6])
-        slide_intro.shapes.add_picture(self.temp_bg, 0, 0, width=self.SLIDE_W, height=self.SLIDE_H)
-        try:
-            slide_intro.shapes.add_picture(self.temp_mask_top, 0, 0, width=self.SLIDE_W, height=Inches(2.0))
-            slide_intro.shapes.add_picture(self.temp_mask_bottom, 0, self.SLIDE_H - Inches(2.0), width=self.SLIDE_W, height=Inches(2.0))
-        except: pass
-        intro_cover_size = Inches(5.0)
-        intro_cover_left = (self.SLIDE_W - intro_cover_size) / 2
-        slide_intro.shapes.add_picture(self.temp_cover, intro_cover_left, Inches(0.8), width=intro_cover_size, height=intro_cover_size)
-        tx_intro = slide_intro.shapes.add_textbox(0, Inches(6.0), self.SLIDE_W, Inches(1.5))
-        p_title = tx_intro.text_frame.add_paragraph()
-        p_title.text = self.metadata['title'] 
-        p_title.font.size = Pt(36)
-        p_title.font.bold = True
-        p_title.font.color.rgb = RGBColor(255, 255, 255)
-        p_title.alignment = PP_ALIGN.CENTER
-        p_artist = tx_intro.text_frame.add_paragraph()
-        p_artist.text = self.metadata['artist']
-        p_artist.font.size = Pt(24)
-        p_artist.font.color.rgb = RGBColor(180, 180, 180)
-        p_artist.alignment = PP_ALIGN.CENTER
+        self.create_cover_slide(prs)
 
-        # 纯音乐逻辑
         if self.is_pure_music or not self.metadata['lyrics']:
-            self._log(f"[完成] 纯音乐模式：仅生成封面，跳过歌词页。")
-            try:
-                prs.save(self.output_ppt_path)
-                self._clean_temp_files()
-                return True
-            except Exception as e:
-                self._log(f"[错误] 保存失败: {e}")
-                return False
+            self._log(f"纯音乐模式：仅生成封面")
+            try: prs.save(self.output_ppt_path)
+            except Exception as e: self._log(f"保存失败: {e}")
+            return True
 
-        # Slide 2+: 歌词
         lyrics = self.metadata['lyrics']
+        
+        lyric_cover_top = (self.SLIDE_H - self.LYRIC_COVER_SIZE) / 2 - Inches(1.0)
+        lyric_text_top = lyric_cover_top + self.LYRIC_COVER_SIZE + Inches(0.2)
+
         for current_idx in range(len(lyrics)):
             slide = prs.slides.add_slide(prs.slide_layouts[6])
-            slide.shapes.add_picture(self.temp_bg, 0, 0, width=self.SLIDE_W, height=self.SLIDE_H)
-            dynamic_top = self.CENTER_Y - (current_idx * self.SCROLL_UNIT_HEIGHT) - Inches(0.5)
-            tb = slide.shapes.add_textbox(self.TEXTBOX_X, dynamic_top, self.TEXTBOX_W, self.TEXTBOX_H)
-            tf = tb.text_frame
-            tf.word_wrap = True 
-            tf.auto_size = MSO_AUTO_SIZE.NONE
-            tf.clear()
-            for line_idx, line_text in enumerate(lyrics):
+            
+            # 1. 绘制背景 (最底层)
+            slide.shapes.add_picture(self.mem_bg, 0, 0, width=self.SLIDE_W, height=self.SLIDE_H)
+            
+            # 2. [关键顺序调整] 绘制歌词 (中间层 - 下)
+            # 歌词先画，这样它会被后面的遮罩盖住，但会被最后的封面压住（如果重叠的话）
+            for target_idx in range(len(lyrics)):
+                raw_line_text = lyrics[target_idx]
+                line_text = raw_line_text.replace('^', '\n').replace(' ^ ', '\n')
+                
+                offset = target_idx - current_idx
+                
+                pos_y = self.CENTER_Y + (offset * self.LINE_SPACING) - (self.TEXTBOX_H / 2)
+                
+                tb = slide.shapes.add_textbox(self.TEXTBOX_X, pos_y, self.TEXTBOX_W, self.TEXTBOX_H)
+                tf = tb.text_frame
+                tf.word_wrap = True 
+                tf.vertical_anchor = MSO_ANCHOR.MIDDLE 
+                
                 p = tf.add_paragraph()
                 p.text = line_text
-                if line_idx == current_idx:
-                    p.font.size = Pt(self.STYLE_ACTIVE['size'])
+                p.alignment = PP_ALIGN.CENTER 
+                
+                if offset == 0:
+                    text_len = len(line_text)
+                    if text_len > 30: final_size = 28
+                    elif text_len > 18: final_size = 32
+                    else: final_size = self.STYLE_ACTIVE['size']
+                    
+                    p.font.size = Pt(final_size)
                     p.font.bold = self.STYLE_ACTIVE['bold']
                     p.font.color.rgb = RGBColor(*self.STYLE_ACTIVE['color'])
                 else:
-                    p.font.size = Pt(self.STYLE_NORMAL['size'])
+                    text_len = len(line_text)
+                    if text_len > 20: final_size = 20
+                    else: final_size = self.STYLE_NORMAL['size']
+                        
+                    p.font.size = Pt(final_size)
                     p.font.bold = self.STYLE_NORMAL['bold']
                     p.font.color.rgb = RGBColor(*self.STYLE_NORMAL['color'])
-                p.alignment = PP_ALIGN.CENTER
-                p.space_before = Pt(0)
-                p.space_after = Pt(30) 
+
+            # 3. [关键顺序调整] 绘制遮罩 (中间层 - 上)
+            # 遮罩要盖在歌词上面，所以放在歌词后面画
             try:
-                slide.shapes.add_picture(self.temp_mask_top, 0, 0, width=self.SLIDE_W, height=Inches(2.0))
-                slide.shapes.add_picture(self.temp_mask_bottom, 0, self.SLIDE_H - Inches(2.0), width=self.SLIDE_W, height=Inches(2.0))
+                slide.shapes.add_picture(self.mem_mask_top, 0, 0, width=self.SLIDE_W, height=Inches(self.MASK_H_INCH))
+                slide.shapes.add_picture(self.mem_mask_bottom, 0, self.SLIDE_H - Inches(self.MASK_H_INCH), width=self.SLIDE_W, height=Inches(self.MASK_H_INCH))
             except: pass
-            small_cover_size = Inches(3.2)
-            slide.shapes.add_picture(self.temp_cover, Inches(0.8), Inches(2.0), width=small_cover_size, height=small_cover_size)
-            info_box = slide.shapes.add_textbox(Inches(0.8), Inches(2.0) + small_cover_size + Inches(0.1), small_cover_size, Inches(1.5))
+
+            # 4. [关键顺序调整] 绘制左侧封面和信息 (最顶层)
+            # 最后画封面，确保它在所有图层（包括遮罩）的最上面，不会被遮挡
+            slide.shapes.add_picture(self.mem_cover, self.LYRIC_COVER_LEFT, lyric_cover_top, width=self.LYRIC_COVER_SIZE, height=self.LYRIC_COVER_SIZE)
+            
+            info_box = slide.shapes.add_textbox(self.LYRIC_COVER_LEFT, lyric_text_top, self.LYRIC_COVER_SIZE, Inches(2.0))
+            info_box.text_frame.word_wrap = True
+            
             p_song = info_box.text_frame.add_paragraph()
             p_song.text = self.metadata['title']
             p_song.font.size = Pt(20)
             p_song.font.bold = True
             p_song.font.color.rgb = RGBColor(255, 255, 255)
             p_song.alignment = PP_ALIGN.CENTER
+            
             p_art = info_box.text_frame.add_paragraph()
             p_art.text = self.metadata['artist']
             p_art.font.size = Pt(14)
             p_art.font.color.rgb = RGBColor(180, 180, 180)
             p_art.alignment = PP_ALIGN.CENTER
 
+        self.create_cover_slide(prs)
+
         try:
             prs.save(self.output_ppt_path)
-        except PermissionError:
-            self._log(f"[错误] 保存失败！文件被占用: {self.output_ppt_path}")
-            return False
-        
-        self._clean_temp_files()
-        return True
-
-    def _clean_temp_files(self):
-        for f in [self.temp_bg, self.temp_cover, self.temp_mask_top, self.temp_mask_bottom]:
-            if os.path.exists(f): 
-                try: os.remove(f)
-                except: pass
-
-def process_single_audio(filename, output_dir):
-    try:
-        file_base_name = os.path.splitext(filename)[0]
-        relative_output_path = os.path.join(output_dir, f"{file_base_name}.pptx")
-        abs_output_path = os.path.abspath(relative_output_path)
-        
-        converter = AudioToPPT(filename, abs_output_path)
-        converter.extract_metadata()
-        success = converter.generate_ppt()
-        
-        final_name = converter.metadata.get('title', file_base_name)
-        if final_name == '未知标题': final_name = file_base_name
-
-        if success:
-            safe_print(f"[{final_name}] [完成] PPT已生成")
             return True
-        else:
+        except Exception as e:
+            self._log(f"保存失败: {e}")
             return False
-    except Exception as e:
-        safe_print(f"[{filename}] [失败] 错误: {e}")
-        return False
 
-def cleanup_residual_files():
-    """
-    清理逻辑：扫描目录中所有符合脚本生成的临时文件格式，并删除。
-    防止程序崩溃后垃圾文件残留。
-    """
-    # 匹配模式：temp_xxx_8位hex.jpg
-    # 例如: temp_bg_a1b2c3d4.jpg
-    patterns = [
-        "temp_bg_*.jpg", 
-        "temp_cover_*.jpg", 
-        "temp_mask_top_*.jpg", 
-        "temp_mask_bottom_*.jpg"
-    ]
+def process_single_audio(file_path, output_dir):
+    start_time = time.time()
+    result = {"success": False, "is_pure": False, "duration": 0}
     
-    deleted_count = 0
-    for pattern in patterns:
-        for filepath in glob.glob(pattern):
-            # 简单校验文件名，防止误删用户文件 (检查是否包含 'temp_' 和 '.jpg')
-            if "temp_" in filepath and filepath.endswith(".jpg"):
-                try:
-                    os.remove(filepath)
-                    deleted_count += 1
-                except Exception:
-                    pass
+    try:
+        file_base_name = os.path.splitext(os.path.basename(file_path))[0]
+        relative_output_path = os.path.join(output_dir, f"{file_base_name}.pptx")
+        
+        converter = AudioToPPT(file_path, os.path.abspath(relative_output_path))
+        converter.extract_metadata()
+        
+        if converter.generate_ppt():
+            safe_print(f"[{file_base_name}] [完成] PPT已生成")
+            result["success"] = True
+            result["is_pure"] = converter.is_pure_music
+        else:
+            result["success"] = False
+            
+    except Exception as e:
+        safe_print(f"[{file_path}] [失败] {e}")
+        result["success"] = False
     
-    if deleted_count > 0:
-        print(f"\n[清理] 已自动清理 {deleted_count} 个残留的临时文件。")
+    result["duration"] = time.time() - start_time
+    return result
 
 def batch_process():
-    output_dir = "output"
+    input_dir, output_dir = "music", "output"
+    if not os.path.exists(input_dir):
+        os.makedirs(input_dir)
+        print(f"[目录] 已自动创建 '{input_dir}' 文件夹。")
     if not os.path.exists(output_dir): os.makedirs(output_dir)
-    audio_exts = ('.flac', '.mp3', '.wav', '.m4a')
-    files = [f for f in os.listdir('.') if f.lower().endswith(audio_exts)]
-    if not files:
-        print("[错误] 未找到音频文件。")
-        cleanup_residual_files() # 即使没文件也检查一下残留
+
+    root_files = [f for f in os.listdir('.') if os.path.isfile(f)]
+    moved = 0
+    for f in root_files:
+        if f.lower().endswith(('.flac', '.mp3', '.wav', '.m4a')):
+            try:
+                shutil.move(os.path.abspath(f), os.path.join(os.path.abspath(input_dir), f))
+                moved += 1
+            except: pass
+    if moved > 0: print(f"[整理] 已整理 {moved} 个文件到 music 文件夹。\n")
+
+    files_in_dir = [f for f in os.listdir(input_dir) if f.lower().endswith(('.flac', '.mp3', '.wav', '.m4a'))]
+    if not files_in_dir:
+        print("[错误] music 文件夹为空。")
         return
+
+    max_workers = AI_CONFIG.get("max_workers", 4)
+    print(f"[开始] 发现 {len(files_in_dir)} 个文件 (并发: {max_workers})\n")
     
-    print(f"[扫描] 发现 {len(files)} 个文件 | 模式：交互配置 + 纯音乐过滤 + 自动清理残留\n")
+    total_start_time = time.time()
+    stats = {
+        "total_success": 0, "total_fail": 0,
+        "pure_count": 0, "pure_duration": 0,
+        "lyric_count": 0, "lyric_duration": 0
+    }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_single_audio, os.path.join(input_dir, f), output_dir): f for f in files_in_dir}
+        
+        for future in as_completed(futures):
+            res = future.result()
+            if res["success"]:
+                stats["total_success"] += 1
+                if res["is_pure"]:
+                    stats["pure_count"] += 1
+                    stats["pure_duration"] += res["duration"]
+                else:
+                    stats["lyric_count"] += 1
+                    stats["lyric_duration"] += res["duration"]
+            else:
+                stats["total_fail"] += 1
     
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(process_single_audio, f, output_dir) for f in files]
-        for future in as_completed(futures): pass
-    
-    # --- 最终清理 ---
-    cleanup_residual_files()
-    
-    print(f"\n[结束] 全部处理完毕！请查看 {output_dir} 文件夹。")
+    total_duration = time.time() - total_start_time
+    avg_pure = stats["pure_duration"] / stats["pure_count"] if stats["pure_count"] > 0 else 0
+    avg_lyric = stats["lyric_duration"] / stats["lyric_count"] if stats["lyric_count"] > 0 else 0
+
+    print(f"\n" + "="*40)
+    print(f"          详 细 统 计 报 告")
+    print(f"="*40)
+    print(f"[时间] 总耗时       : {total_duration:.2f} 秒")
+    print(f"[成功] 处理成功     : {stats['total_success']} 首")
+    print(f"[失败] 处理失败     : {stats['total_fail']} 首")
+    print(f"-"*40)
+    print(f"[音乐] 纯音乐       : {stats['pure_count']} 首")
+    print(f"[速度] 纯音乐速度   : {avg_pure:.2f} 秒/首")
+    print(f"-"*40)
+    print(f"[歌词] 带歌词音乐   : {stats['lyric_count']} 首")
+    print(f"[速度] 带歌词速度   : {avg_lyric:.2f} 秒/首")
+    print(f"="*40 + "\n")
+    print(f"[输出] 目录: {os.path.abspath(output_dir)}")
 
 if __name__ == "__main__":
     batch_process()
